@@ -9,13 +9,15 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from PIL import ImageFont
 
-from layoutparser.models.detectron2 import Detectron2LayoutModel
 import layoutparser as lp
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pdf2image
 from pathlib import Path
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 DPI = 72
 
@@ -24,11 +26,6 @@ DPI = 72
 font_name = 'BIZUDGothic'
 font_ttf = 'fonts/BIZUDGothic-Regular.ttf'
 pdfmetrics.registerFont(TTFont(font_name, font_ttf))
-
-
-# pdfを画像として読み込む
-def pdf_to_image(file_path, page_num):
-    return np.asarray(pdf2image.convert_from_path(file_path, dpi=DPI)[page_num])
 
 
 # 特定のtext_blockがparagraph_blockに含まれているかチェック
@@ -90,10 +87,7 @@ def get_max_font_size(paragraph_width, paragraph_height, translated_text, font_f
     return 0
 
 
-
-
-
-def run(target_pdf_file_path: Path, dpi: int, model: Detectron2LayoutModel, translator: Pipeline, is_mihiraki: bool, font_name: str):
+def run(target_pdf_file_path: Path, dpi: int, model: lp.Detectron2LayoutModel, translator: Pipeline, is_mihiraki: bool, font_name: str):
 
     # 翻訳モデル: fugumt
 
@@ -103,26 +97,20 @@ def run(target_pdf_file_path: Path, dpi: int, model: Detectron2LayoutModel, tran
 
     output = PdfWriter()
 
-    pdf_pages, _ = lp.load_pdf(str(target_pdf_file_path),
-                            load_images=True, dpi=dpi)
+    pdf_pages, pdf_images = lp.load_pdf(target_pdf_file_path, load_images=True, dpi=dpi)
 
-    for page_index, pdf_page in enumerate(pdf_pages):
-        print("■%s ページ目" % page_index)
+    for page_index, (pdf_page, pdf_image) in enumerate(zip(pdf_pages, pdf_images)):
+        logger.info(f'{page_index}')
         # テキストブロックを取得
-        text_blocks = pdf_page.get_homogeneous_blocks()
-        # pdfを画像として取得
-        pdf_image = pdf_to_image(target_pdf_file_path, page_index)
-        # 座標取る
-        height, width, channel = pdf_image.shape
-        print(height, width)
-        plt.imshow(pdf_image)
+        text_blocks: list[lp.TextBlock] = pdf_page.get_homogeneous_blocks()
+        width, height = pdf_image.size
+        # print(base_height, height, dpi)
         # レイアウトを取得
         pdf_layout = model.detect(pdf_image)
-
         # 段落ブロックの処理
         # 段落ブロックを抽出
         paragraph_blocks = lp.Layout(
-            [b for b in pdf_layout if b.type == 'Text'])
+            [b for b in pdf_layout if isinstance(b, lp.TextBlock) and b.type == 'Text'])
 
         cover_packet = io.BytesIO()
         cover_canvas = canvas.Canvas(cover_packet, pagesize=(
@@ -132,16 +120,21 @@ def run(target_pdf_file_path: Path, dpi: int, model: Detectron2LayoutModel, tran
         text_canvas = canvas.Canvas(text_packet, pagesize=(
             int(base_width), int(base_height)), bottomup=True)
         for paragraph_block in paragraph_blocks:
+            inner_text_blocks = [
+                text_block for text_block in text_blocks
+                if text_block.is_in(
+                    paragraph_block,
+                    {'left': (p := 10 if paragraph_block.width > 300 else 3),
+                     'right': p, 'bottom': p})
+            ]
             # 段落中のテキストブロックを抽出
-            inner_text_blocks = list(
-                filter(lambda x: is_inside(paragraph_block, x), text_blocks))
             print(len(inner_text_blocks))
             if len(inner_text_blocks) == 0:
                 continue
             # 段落中のテキストブロックからテキストを抽出
-            text = " ".join(list(map(lambda x: x.text, inner_text_blocks)))
-            print(text)
-            translated_text = ""
+            text = ' '.join(map(lambda x: x.text, inner_text_blocks))
+            #print(text)
+            translated_text = ''
             # テキストを翻訳
             if len(text) > 1000:
                 n = len(text)
@@ -161,20 +154,20 @@ def run(target_pdf_file_path: Path, dpi: int, model: Detectron2LayoutModel, tran
             else:
                 result = translator(text)
                 translated_text = result[0]['translation_text']
-            print(translated_text)
+            #print(translated_text)
             paragraph_x = (paragraph_block.block.x_1 / width) * base_width
             paragraph_y = (paragraph_block.block.y_2 / height) * base_height
             paragraph_width = (
-                (paragraph_block.block.x_2 - paragraph_block.block.x_1) / width) * base_width
+                (paragraph_block.block.width) / width) * base_width
             paragraph_height = (
-                (paragraph_block.block.y_2 - paragraph_block.block.y_1) / height) * base_height
+                (paragraph_block.block.height) / height) * base_height
 
             # カバーフレームの追加
-            fill_cover(cover_canvas, paragraph_x, height -
+            fill_cover(cover_canvas, paragraph_x, base_height -
                        paragraph_y, paragraph_width, paragraph_height)
 
             # テキストフレームの追加
-            frame = Frame(paragraph_x, height - paragraph_y, paragraph_width, paragraph_height,
+            frame = Frame(paragraph_x, base_height - paragraph_y, paragraph_width, paragraph_height,
                           showBoundary=0, leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
             # テキスト実態の追加
             fontsize = calc_fontsize(
@@ -213,18 +206,18 @@ def run(target_pdf_file_path: Path, dpi: int, model: Detectron2LayoutModel, tran
             print("error: %s" % e)
 
         output.add_page(base_page)
-        output_filepath = target_pdf_file_path.with_name(
-            "translated_" + target_pdf_file_path.name)
-        output.write(output_filepath)
+
+    output_filepath = target_pdf_file_path.with_name("translated_" + target_pdf_file_path.name)
+    output.write(output_filepath)
 
 
 if __name__ == '__main__':
     # レイアウト(物体)検出モデルを準備
     target_pdf_file_path = Path('input.pdf')
     model = lp.Detectron2LayoutModel('lp://PubLayNet/mask_rcnn_X_101_32x8d_FPN_3x/config',
-                                  extra_config=[
-                                      "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
-                                  label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"})
+                                     extra_config=[
+                                         "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.5],
+                                     label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"})
     translator = pipeline('translation', model='staka/fugumt-en-ja')
     is_mihiraki = True
     font_name = 'BIZUDGothic'
